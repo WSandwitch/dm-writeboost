@@ -28,6 +28,7 @@
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
 #include <linux/mutex.h>
+#include <linux/rwsem.h>
 #include <linux/kthread.h>
 #include <linux/sched.h>
 #include <linux/timer.h>
@@ -243,6 +244,12 @@ enum WB_FLAG {
 	WB_CREATED = 0,
 };
 
+enum WB_FREEZE_STATE {
+	WB_FREEZE_NONE = 0,
+	WB_FREEZE_DRAINING,
+	WB_FREEZE_FROZEN,
+};
+
 #define SEGMENT_SIZE_ORDER 10
 #define NR_RAMBUF_POOL 8
 
@@ -262,6 +269,8 @@ struct wb_device {
 
 	bool do_format; /* True if it was the first creation */
 	struct mutex io_lock; /* Mutex is light-weighed */
+	struct rw_semaphore freeze_lock;
+	int freeze_state;
 
 	/*
 	 * Wq to wait for nr_inflight_ios to be zero.

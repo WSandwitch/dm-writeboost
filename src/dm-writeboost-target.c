@@ -782,6 +782,9 @@ static bool reserve_read_cache_cell(struct wb_device *wb, struct bio *bio)
 
 	ASSERT(cells->threshold > 0);
 
+	if (read_once(wb->freeze_state) != WB_FREEZE_NONE)
+		return false;
+
 	if (!read_once(wb->read_cache_threshold))
 		return false;
 
@@ -1027,6 +1030,11 @@ static void read_cache_proc(struct work_struct *work)
 	struct read_cache_cells *cells = wb->read_cache_cells;
 	u32 i;
 
+	if (read_once(wb->freeze_state) != WB_FREEZE_NONE) {
+		reinit_read_cache_cells(wb);
+		return;
+	}
+
 	read_cache_cancel_background(cells);
 
 	for (i = 0; i < cells->size; i++) {
@@ -1256,6 +1264,9 @@ static int process_write_wa(struct wb_device *wb, struct bio *bio)
 
 static int process_write(struct wb_device *wb, struct bio *bio)
 {
+	if (read_once(wb->freeze_state) == WB_FREEZE_FROZEN)
+		return process_write_wa(wb, bio);
+
 	return wb->write_around_mode ? process_write_wa(wb, bio) : process_write_wb(wb, bio);
 }
 
@@ -1440,6 +1451,7 @@ static int process_barrier_bio(struct wb_device *wb, struct bio *bio)
 static int writeboost_map(struct dm_target *ti, struct bio *bio)
 {
 	struct wb_device *wb = ti->private;
+	int ret;
 
 	struct per_bio_data *pbd = per_bio_data(wb, bio);
 	pbd->type = PBD_NONE;
@@ -1447,7 +1459,11 @@ static int writeboost_map(struct dm_target *ti, struct bio *bio)
 	if (bio_is_barrier(bio))
 		return process_barrier_bio(wb, bio);
 
-	return process_bio(wb, bio);
+	down_read(&wb->freeze_lock);
+	ret = process_bio(wb, bio);
+	up_read(&wb->freeze_lock);
+
+	return ret;
 }
 
 /*
@@ -1654,6 +1670,8 @@ static int init_core_struct(struct dm_target *ti)
 	}
 
 	mutex_init(&wb->io_lock);
+	init_rwsem(&wb->freeze_lock);
+	wb->freeze_state = WB_FREEZE_NONE;
 	init_waitqueue_head(&wb->inflight_ios_wq);
 	spin_lock_init(&wb->mb_lock);
 	atomic64_set(&wb->nr_dirty_caches, 0);
@@ -1840,6 +1858,45 @@ static void writeboost_postsuspend(struct dm_target *ti)
 	dm_blkdev_issue_flush(wb->cache_dev->bdev, GFP_NOIO);
 }
 
+static int writeboost_freeze(struct wb_device *wb)
+{
+	int err = 0;
+
+	down_write(&wb->freeze_lock);
+
+	if (wb->freeze_state == WB_FREEZE_FROZEN) {
+		up_write(&wb->freeze_lock);
+		return 0;
+	}
+
+	wb->freeze_state = WB_FREEZE_DRAINING;
+
+	cancel_work_sync(&wb->read_cache_work);
+
+	flush_current_buffer(wb);
+
+	wb->force_drop = true;
+	err = wait_event_interruptible(wb->wait_drop_caches,
+		!atomic64_read(&wb->nr_dirty_caches));
+	wb->force_drop = false;
+
+	if (err)
+		wb->freeze_state = WB_FREEZE_NONE;
+	else
+		wb->freeze_state = WB_FREEZE_FROZEN;
+
+	up_write(&wb->freeze_lock);
+
+	return err;
+}
+
+static void writeboost_unfreeze(struct wb_device *wb)
+{
+	down_write(&wb->freeze_lock);
+	wb->freeze_state = WB_FREEZE_NONE;
+	up_write(&wb->freeze_lock);
+}
+
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,17,0)
 static int writeboost_message(struct dm_target *ti, unsigned argc, char **argv,
 			      char *result, unsigned maxlen)
@@ -1855,6 +1912,14 @@ static int writeboost_message(struct dm_target *ti, unsigned argc, char **argv)
 
 	if (!strcasecmp(argv[0], "clear_stat")) {
 		clear_stat(wb);
+		return 0;
+	}
+
+	if (!strcasecmp(argv[0], "freeze"))
+		return writeboost_freeze(wb);
+
+	if (!strcasecmp(argv[0], "unfreeze")) {
+		writeboost_unfreeze(wb);
 		return 0;
 	}
 
